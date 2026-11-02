@@ -1,75 +1,123 @@
 ---
 name: Master branch workflow
 
-on:
+"on":
   push:
-    branches:
-      - master
-    paths-ignore:
-      - "**.md"
-
+    branches: [master]
   pull_request:
-    branches:
-      - master
-    paths-ignore:
-      - "**.md"
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   GALAXY_ROLE_NAME: christiangda.awscli
+  ANSIBLE_CORE_VERSION: "2.16.14"
+  DOCKER_COLLECTION_VERSION: "3.13.3"
+  TEST_CONTAINER: awscli-ci
+  ANSIBLE_NOCOLOR: "1"
 
 defaults:
   run:
-    working-directory: "christiangda.awscli"
+    shell: bash
+    working-directory: christiangda.awscli
 
 jobs:
   test:
-    name: "Python ${{ matrix.python }} - Ansible ${{ matrix.ansible }} - OS ${{ matrix.scenario }}"
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        python: [3.9]
-        ansible: ["~=4.1"]
-        scenario: ["centos-8"]
-
+    name: Syntax, installation and idempotence (Ubuntu 20.04)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
     steps:
-      - name: Check out the codebase.
-        uses: actions/checkout@v2
+      - name: Check out the role
+        uses: actions/checkout@v4
         with:
           path: ${{ env.GALAXY_ROLE_NAME }}
 
-      - name: Set up Python ${{ matrix.python }}
-        uses: actions/setup-python@v2
+      - name: Set up controller Python
+        uses: actions/setup-python@v5
         with:
-          python: ${{ matrix.python }}
+          python-version: "3.12"
 
-      - name: Upgrade pip
+      # This controller supports the Python 3.8 shipped by Ubuntu 20.04.
+      - name: Install and check controller dependencies
         run: |
-          python -m pip install --upgrade pip
-
-      - name: Install ansible ${{ matrix.ansible }} and dependencies
-        env:
-          ANSIBLE_VERSION: ${{ matrix.ansible }}
-        run: |
-          pip install ansible"$ANSIBLE_VERSION"
-          pip install molecule
-          pip install docker
-          pip install 'molecule[docker]'
-          pip install flake8
-          pip install selinux
-          pip install docker
-          pip install pylint
-          pip install rope
-          pip install ansible-lint
-
-      - name: Show versions
-        run: |
-          flake8 --version
-          molecule --version
+          python -m pip install \
+            "ansible-core==$ANSIBLE_CORE_VERSION" \
+            "yamllint==1.37.1" "PyYAML==6.0.2"
+          python -m pip check
+          ansible-galaxy collection install \
+            "community.docker:$DOCKER_COLLECTION_VERSION"
           ansible --version
-          python -VV
+          docker version
 
-      - name: Run molecule on ${{ matrix.scenario }}
-        env:
-          SCENARIO: ${{ matrix.scenario }}
+      - name: Lint the master workflow
+        run: yamllint .github/workflows/master.yaml
+
+      # Use a supported role target instead of the obsolete CentOS 8 scenario.
+      # EPEL is only needed for EL7, so this test needs no Galaxy role or secrets.
+      - name: Start the test target
         run: |
-          molecule test --scenario-name $SCENARIO
+          docker run --detach --name "$TEST_CONTAINER" ubuntu:20.04 sleep infinity
+          docker exec "$TEST_CONTAINER" bash -euxo pipefail -c '
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get update
+            apt-get install -y --no-install-recommends python3 ca-certificates
+          '
+
+      - name: Prepare inventory and test playbook
+        run: |
+          mkdir -p "$RUNNER_TEMP/awscli-ci"
+          printf '%s ansible_connection=community.docker.docker ansible_python_interpreter=/usr/bin/python3\n' \
+            "$TEST_CONTAINER" > "$RUNNER_TEMP/awscli-ci/inventory"
+          # The parent directory contains the role under its expected Galaxy name.
+          echo "ANSIBLE_ROLES_PATH=$(dirname "$PWD")" >> "$GITHUB_ENV"
+          cat > "$RUNNER_TEMP/awscli-ci/converge.yml" <<'PLAYBOOK'
+          ---
+          - name: Install and verify AWS CLI
+            hosts: all
+            gather_facts: true
+            roles:
+              - role: christiangda.awscli
+            post_tasks:
+              - name: Check the role variables were loaded
+                ansible.builtin.assert:
+                  that:
+                    - cli_package == 'awscli'
+                    - cli_dependencies_packages | length > 0
+                    - cli_global_downloads_retries | int > 0
+                    - cli_global_downloads_delay | int >= 0
+              - name: Verify AWS CLI runs
+                ansible.builtin.command: aws --version
+                register: aws_version
+                changed_when: false
+                failed_when: >-
+                  aws_version.rc != 0 or
+                  'aws-cli/' not in (aws_version.stdout ~ aws_version.stderr)
+          PLAYBOOK
+
+      - name: Check Ansible syntax
+        run: |
+          ansible-playbook -i "$RUNNER_TEMP/awscli-ci/inventory" \
+            "$RUNNER_TEMP/awscli-ci/converge.yml" --syntax-check
+
+      - name: Install AWS CLI and verify variables
+        run: |
+          ansible-playbook -i "$RUNNER_TEMP/awscli-ci/inventory" \
+            "$RUNNER_TEMP/awscli-ci/converge.yml"
+          docker exec "$TEST_CONTAINER" python3 -m pip check
+
+      - name: Check idempotence
+        run: |
+          ansible-playbook -i "$RUNNER_TEMP/awscli-ci/inventory" \
+            "$RUNNER_TEMP/awscli-ci/converge.yml" | tee "$RUNNER_TEMP/awscli-ci/idempotence.log"
+          grep -Eq 'changed=0[[:space:]]+unreachable=0[[:space:]]+failed=0' \
+            "$RUNNER_TEMP/awscli-ci/idempotence.log"
+
+      - name: Remove the test target
+        if: always()
+        run: docker rm --force "$TEST_CONTAINER" || true
